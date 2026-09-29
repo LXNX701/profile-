@@ -1,15 +1,38 @@
 import express from "express";
 import serverless from "serverless-http";
-const app=express();
-const UPSTREAM=process.env.FF_UPSTREAM||"https://free-ff-api-src-5plp.onrender.com";
-const TTL=Number(process.env.CACHE_TTL_MS||300000);
-const cache=new Map();
-const regions={BR:["Brazil","South America","🇧🇷"],SAC:["South America","South America","🌎"],US:["United States","North America","🇺🇸"],NA:["North America","North America","🌎"],LATAM:["Latin America","Latin America","🌎"],IND:["India","South Asia","🇮🇳"],BD:["Bangladesh","South Asia","🇧🇩"],PK:["Pakistan","South Asia","🇵🇰"],ID:["Indonesia","Southeast Asia","🇮🇩"],SG:["Singapore","Southeast Asia","🇸🇬"],TH:["Thailand","Southeast Asia","🇹🇭"],VN:["Vietnam","Southeast Asia","🇻🇳"],TW:["Taiwan","East Asia","🇹🇼"],ME:["Middle East","Middle East","🌍"],RU:["Russia","CIS","🇷🇺"],CIS:["CIS","CIS","🌍"],EU:["Europe","Europe","🇪🇺"],EUROPE:["Europe","Europe","🇪🇺"],MY:["Malaysia","Southeast Asia","🇲🇾"]};
-const ok=x=>/^\\d{5,15}$/.test(String(x||"")); const R=x=>String(x||"").toUpperCase();
-async function call(path,p){const key=path+"|"+JSON.stringify(p),h=cache.get(key);if(h&&Date.now()-h.t<TTL)return h.d;const u=new URL(UPSTREAM+"/api/v1/"+path);Object.entries(p).forEach(([k,v])=>u.searchParams.set(k,v));const r=await fetch(u);const d=await r.json();if(!r.ok)throw Error(d.message||"Provider error");cache.set(key,{t:Date.now(),d});return d}
-app.get("/health",(q,s)=>s.json({ok:true,service:"MOONX7 Profile API"}));app.get("/regions",(q,s)=>s.json({regions:Object.entries(regions).map(([code,v])=>({code,name:v[0],group:v[1],flag:v[2]}))}));
-app.get("/profile",async(q,s)=>{const uid=String(q.query.uid||"").trim(),region=R(q.query.region);if(!ok(uid)||!regions[region])return s.status(400).json({success:false,error:"UID and supported region are required"});try{const [a,p]=await Promise.allSettled([call("account",{uid,region}),call("playerstats",{uid,region})]);if(a.status==="rejected"&&p.status==="rejected")return s.status(404).json({success:false,error:"Player not found"});s.json({success:true,uid,region,regionInfo:{code:region,name:regions[region][0],group:regions[region][1],flag:regions[region][2]},account:a.status==="fulfilled"?a.value:null,stats:p.status==="fulfilled"?p.value:null})}catch(e){s.status(502).json({success:false,error:e.message})}});
-app.get("/account",async(q,s)=>{try{s.json(await call("account",{uid:String(q.query.uid||""),region:R(q.query.region)}))}catch(e){s.status(502).json({success:false,error:e.message})}});
-app.get("/playerstats",async(q,s)=>{try{s.json(await call("playerstats",{uid:String(q.query.uid||""),region:R(q.query.region)}))}catch(e){s.status(502).json({success:false,error:e.message})}});
-app.get("/guild",async(q,s)=>{try{s.json(await call("guildInfo",{guildID:String(q.query.guildID||""),region:R(q.query.region)}))}catch(e){s.status(502).json({success:false,error:e.message})}});
+import { allRegions, buildProfile, call, logSearch, normalizeRegion, regionInfo, REGIONS, validId, validUid } from "../../lib/profile-core.js";
+
+const app = express();
+app.disable("x-powered-by");
+app.use(express.json({limit:"64kb"}));
+const asyncRoute = fn => (req,res) => Promise.resolve(fn(req,res)).catch(e => res.status(502).json({success:false,error:e.message || "API error"}));
+
+app.get("/health",(req,res)=>res.json({ok:true,service:"MOONX7 Profile API",version:"2.0",regions:Object.keys(REGIONS).length,supabase:Boolean(process.env.SUPABASE_URL && (process.env.SUPABASE_SECRET_KEY||process.env.SUPABASE_SERVICE_ROLE_KEY))}));
+app.get("/regions",(req,res)=>res.json({success:true,regions:allRegions()}));
+app.get("/profile",asyncRoute(async(req,res)=>{
+  const uid=String(req.query.uid||"").trim(), region=normalizeRegion(req.query.region);
+  if(!validUid(uid)||!regionInfo(region)) return res.status(400).json({success:false,error:"UID and supported region are required"});
+  const data=await buildProfile(uid,region);
+  await logSearch(uid,region,req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket.remoteAddress || "");
+  res.set("Cache-Control","public, max-age=60, s-maxage=300, stale-while-revalidate=600");
+  res.json(data);
+}));
+for (const [route,path,params] of [
+  ["/account","account","uid"],["/playerstats","playerstats","uid"],["/wishlistitems","wishlistitems","uid"],["/craftlandProfile","craftlandProfile","uid"]
+]) app.get(route,asyncRoute(async(req,res)=>{
+  const uid=String(req.query[params]||"").trim(), region=normalizeRegion(req.query.region);
+  if(!validUid(uid)||!regionInfo(region)) return res.status(400).json({success:false,error:"UID and supported region are required"});
+  res.json(await call(path,{uid,region}));
+}));
+app.get("/craftlandInfo",asyncRoute(async(req,res)=>{
+  const map_code=String(req.query.map_code||"").trim(), region=normalizeRegion(req.query.region);
+  if(!validId(map_code)||!regionInfo(region)) return res.status(400).json({success:false,error:"map_code and supported region are required"});
+  res.json(await call("craftlandInfo",{map_code,region}));
+}));
+app.get("/guild",asyncRoute(async(req,res)=>{
+  const guildID=String(req.query.guildID||"").trim(), region=normalizeRegion(req.query.region);
+  if(!validId(guildID)||!regionInfo(region)) return res.status(400).json({success:false,error:"guildID and supported region are required"});
+  res.json(await call("guildInfo",{guildID,region}));
+}));
+app.get("/",(req,res)=>res.json({service:"MOONX7 Profile API",version:"2.0",endpoints:["/api/profile","/api/account","/api/playerstats","/api/wishlistitems","/api/craftlandProfile","/api/craftlandInfo","/api/guild","/api/regions"]}));
 export const handler=serverless(app);
